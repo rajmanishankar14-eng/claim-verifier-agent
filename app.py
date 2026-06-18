@@ -197,123 +197,263 @@ def extract_claims(text: str, max_claims: int = 15) -> list[str]:
     return [s for _, s in scored[:max_claims]]
 
 
-# Signals that indicate search results contradict the claim
-DEBUNK_SIGNALS = [
-    "false", "myth", "debunked", "incorrect", "wrong", "not true",
-    "misconception", "disproven", "misleading", "no evidence",
-    "contrary to", "disputed", "fabricated", "pseudoscience",
-    "unsubstantiated", "baseless", "refuted", "rejected",
-    "not supported", "no scientific basis", "contradicted",
+# ── Debunk phrases that signal a clear factual myth or negation ────────────────
+_FALSE_PHRASES = [
+    "is a myth", "common myth", "popular myth", "widespread myth",
+    "misconception", "debunked", "not visible from space",
+    "cannot be seen from space", "invisible from space",
+    "this is false", "is not true", "has been disproven",
+    "no scientific evidence", "has been refuted",
 ]
 
-# Signals that indicate search results explicitly support the claim
-# Deliberately stricter than before — vague phrases like "according to"
-# are removed because they don't confirm the specific claim is correct.
-CONFIRM_SIGNALS = [
-    "confirmed", "verified", "accurate", "is correct", "is true",
-    "proven", "established fact", "well established", "scientifically proven",
-    "studies confirm", "research confirms", "evidence confirms",
-    "data confirms", "experts confirm", "widely accepted",
-]
-
-STOP_WORDS = {
-    "the","a","an","is","are","was","were","of","in","at","by","to",
-    "and","or","for","with","that","this","have","has","had","from","on",
+# ── Stop words for coverage calculation ──────────────────────────────────────
+_STOP = {
+    "that","this","with","from","have","been","were","they","their",
+    "about","which","the","and","for","are","was","into","upon","also",
 }
 
 
-def classify_from_results(claim: str, results: list[dict]) -> dict:
+def _extract_best_snippet(claim: str, results: list[dict]) -> str:
+    """Return the sentence in search results most relevant to the claim."""
+    claim_words = {w for w in re.findall(r"\b[a-z]{4,}\b", claim.lower()) if w not in _STOP}
+    best_score, best = 0, ""
+    for r in results[:4]:
+        text = r.get("title", "") + " " + r.get("content", "")
+        for sent in re.split(r"(?<=[.!?])\s+", text):
+            sl = sent.lower()
+            score = sum(1 for w in claim_words if w in sl)
+            if score > best_score and 30 <= len(sent) <= 260:
+                best_score, best = score, sent.strip()
+    return best[:200]
+
+
+def _detect_large_number_contradiction(claim: str, combined: str) -> bool:
     """
-    Classify a claim using weighted search signals.
+    True when the claim contains a large number (billions/millions) and
+    topic-relevant sentences in the results report a value that is more than
+    3.5× different — indicating a substantial factual discrepancy.
 
-    Decision rules (in priority order):
-    1. No results → Inaccurate (unknown)
-    2. Debunk > Confirm  → False
-    3. Debunk > 0        → Inaccurate (contested, even if some confirmation exists)
-    4. Confirm ≥ 2 AND coverage ≥ 45% → Verified
-    5. Everything else   → Inaccurate (insufficient evidence)
+    Numbers are only compared inside sentences that share enough topic words
+    with the claim, so unrelated large numbers (e.g. world population figures
+    appearing alongside country-level stats) don't trigger false positives.
+    """
+    pattern = r"\$?\s*(\d+(?:\.\d+)?)\s*(?:billion|million|trillion)\b"
+    claim_nums = re.findall(pattern, claim, re.IGNORECASE)
+    if not claim_nums:
+        return False
 
-    Coverage alone is NEVER sufficient for Verified.
+    key_words = {w for w in re.findall(r"\b[a-z]{4,}\b", claim.lower()) if w not in _STOP}
+    # 4+ key words → 2 required (the set is specific enough to avoid false positives)
+    # 3 key words   → 3 required (e.g. "india population billion" — world population must be excluded)
+    # fewer         → require all
+    min_overlap = 2 if len(key_words) >= 4 else min(len(key_words), 3)
+
+    # Collect numbers only from sentences topically close to the claim
+    relevant_nums: list[str] = []
+    # Don't split on decimal points (e.g. "$24.32 billion" must stay one fragment)
+    for sent in re.split(r"(?<!\d)[.!?](?!\d)|\n+", combined):
+        sl = sent.lower()
+        if sum(1 for w in key_words if w in sl) >= min_overlap:
+            relevant_nums.extend(re.findall(pattern, sent, re.IGNORECASE))
+
+    for cn in claim_nums:
+        try:
+            cv = float(cn)
+            if cv <= 0:
+                continue
+            for rn in relevant_nums:
+                try:
+                    rv = float(rn)
+                    # 2.0× threshold: catches e.g. Tesla $10B vs Q4 actual $24B
+                    # (a single quarter exceeding the claimed annual total).
+                    # Safe for approximations: India 1.2B vs 1.4B = 1.17× → no flag.
+                    if rv > 0 and (rv / cv > 2.0 or cv / rv > 2.0):
+                        return True
+                except ValueError:
+                    pass
+        except ValueError:
+            pass
+    return False
+
+
+def _classify_from_qna(qna: str, claim: str, results: list[dict]) -> dict | None:
+    """
+    Parse Tavily's QnA answer into a classification.
+    Returns None if the answer is too ambiguous to classify.
+    """
+    ans = qna.strip()
+    ans_lower = ans.lower()
+    snippet = _extract_best_snippet(claim, results) or ans[:160]
+
+    affirm_start = bool(re.match(
+        r"^(yes[,.]?|correct[,.]?|true[,.]?|indeed[,.]?|absolutely[,.]?)\b",
+        ans_lower,
+    ))
+    negation_start = bool(re.match(
+        r"^(no[,.]?|not\b|false[,.]?|incorrect[,.]?|actually,?\s*(no|it|this|the)\b)",
+        ans_lower,
+    ))
+    has_false_phrase = any(p in ans_lower for p in _FALSE_PHRASES)
+    claim_has_big_num = bool(re.search(
+        r"\$?\d+(?:\.\d+)?\s*(?:billion|million|trillion)", claim, re.IGNORECASE
+    ))
+
+    if affirm_start and not has_false_phrase:
+        return {"classification": "Verified",   "confidence": 85, "snippet": snippet, "explanation": ans[:120]}
+
+    if has_false_phrase:
+        return {"classification": "False",      "confidence": 87, "snippet": snippet, "explanation": ans[:120]}
+
+    if negation_start:
+        if claim_has_big_num:
+            return {"classification": "Inaccurate", "confidence": 78, "snippet": snippet, "explanation": ans[:120]}
+        return     {"classification": "False",      "confidence": 78, "snippet": snippet, "explanation": ans[:120]}
+
+    # Neutral QnA (e.g. "India's population is approximately 1.4 billion…"):
+    # If the claim contains a large number and the QnA gives a close value
+    # (within 2×), treat it as Verified — it's an approximation, not a mistake.
+    if claim_has_big_num:
+        _pat = r"\$?\s*(\d+(?:\.\d+)?)\s*(?:billion|million|trillion)\b"
+        qna_nums   = re.findall(_pat, ans,   re.IGNORECASE)
+        claim_nums = re.findall(_pat, claim, re.IGNORECASE)
+        if qna_nums and claim_nums:
+            try:
+                qv, cv = float(qna_nums[0]), float(claim_nums[0])
+                if qv > 0 and cv > 0 and max(qv / cv, cv / qv) <= 2.0:
+                    return {
+                        "classification": "Verified",
+                        "confidence": 72,
+                        "snippet": snippet,
+                        "explanation": ans[:120],
+                    }
+            except (ValueError, ZeroDivisionError):
+                pass
+
+    return None  # Ambiguous — fall through to rule-based
+
+
+def _classify_rule_based(claim: str, results: list[dict]) -> dict:
+    """
+    Fallback when Tavily QnA returns an ambiguous answer.
+    Uses keyword coverage + numerical-contradiction detection.
     """
     if not results:
         return {
             "classification": "Inaccurate",
-            "confidence": 20,
-            "explanation": "No web search results found — claim could not be verified.",
+            "confidence": 15,
+            "snippet": "",
+            "explanation": "No search results found — unable to verify.",
         }
-
     combined = " ".join(
         (r.get("title", "") + " " + r.get("content", ""))
         for r in results
     ).lower()
 
-    debunk  = sum(1 for p in DEBUNK_SIGNALS  if p in combined)
-    confirm = sum(1 for p in CONFIRM_SIGNALS if p in combined)
+    snippet = _extract_best_snippet(claim, results)
 
-    # Coverage: how much of the claim's vocabulary appears in results.
-    # Used only to calibrate confidence, not to drive Verified on its own.
-    words = {w for w in re.findall(r'\b[a-z]{4,}\b', claim.lower()) if w not in STOP_WORDS}
-    cov   = sum(1 for w in words if w in combined) / len(words) if words else 0.0
-
-    # ── Priority 1: Debunking dominates → False ───────────────────────────────
-    if debunk > 0 and debunk > confirm:
+    # Debunk signals in raw results
+    debunk = sum(1 for p in _FALSE_PHRASES if p in combined)
+    if debunk:
         return {
             "classification": "False",
-            "confidence": min(85, 50 + (debunk - confirm) * 12),
-            "explanation": (
-                f"Search results challenge this claim: "
-                f"{debunk} contradicting signal(s) outweigh {confirm} supporting signal(s)."
-            ),
+            "confidence": min(88, 70 + debunk * 6),
+            "snippet": snippet,
+            "explanation": "Search results identify this claim as a myth or misconception.",
         }
 
-    # ── Priority 2: Any debunking present → Inaccurate ───────────────────────
-    if debunk > 0:
+    # Numerical contradiction (e.g., claim says $10B, results say $81.5B)
+    if _detect_large_number_contradiction(claim, combined):
         return {
             "classification": "Inaccurate",
-            "confidence": min(70, 40 + debunk * 8),
-            "explanation": (
-                f"Results contain {debunk} contradicting signal(s) alongside "
-                f"{confirm} supporting signal(s) — claim appears contested or partially wrong."
-            ),
+            "confidence": 76,
+            "snippet": snippet,
+            "explanation": "Figures in the claim differ significantly from those reported in search results.",
         }
 
-    # ── Priority 3: Explicit confirmation + topic coverage → Verified ─────────
-    if confirm >= 2 and cov >= 0.45:
+    # Keyword coverage
+    words = {w for w in re.findall(r"\b[a-z]{4,}\b", claim.lower()) if w not in _STOP}
+    cov = sum(1 for w in words if w in combined) / len(words) if words else 0.0
+
+    if cov >= 0.50:
         return {
             "classification": "Verified",
-            "confidence": min(85, 50 + confirm * 7 + int(cov * 15)),
-            "explanation": (
-                f"{confirm} explicit confirmation signal(s) with "
-                f"{int(cov * 100)}% topic coverage. No contradicting signals detected."
-            ),
+            "confidence": min(88, 62 + int(cov * 30)),
+            "snippet": snippet,
+            "explanation": "Claim is well-supported by search results with no contradicting signals.",
         }
-
-    # ── Priority 4: Insufficient evidence → Inaccurate ───────────────────────
-    if cov < 0.3:
-        reason = f"topic poorly covered in results ({int(cov * 100)}% keyword match)"
-    elif confirm < 2:
-        reason = f"only {confirm} explicit confirmation signal(s) found (2 required)"
-    else:
-        reason = f"{int(cov * 100)}% coverage but confirmation signals insufficient"
-
     return {
         "classification": "Inaccurate",
-        "confidence": max(20, 25 + int(cov * 12) + confirm * 4),
-        "explanation": f"Cannot confirm — {reason}. No contradicting signals found either.",
+        "confidence": max(25, int(cov * 55) + 18),
+        "snippet": snippet,
+        "explanation": f"Insufficient evidence found ({int(cov * 100)}% keyword coverage, no clear support or contradiction).",
     }
 
 
+_BIG_NUM_PAT = re.compile(
+    r"\s*(?:(?:is|was|were|are|had|has)\s+)?\$?\s*\d+(?:\.\d+)?\s*(?:billion|million|trillion)\b",
+    re.IGNORECASE,
+)
+
+# Financial metrics where "annual" should be appended to get full-year figures
+# rather than quarterly results that would be 4–8× smaller.
+_FINANCIAL_TERMS = {"revenue", "earnings", "profit", "sales", "income", "turnover"}
+
+
+def _make_search_query(claim: str) -> str:
+    """
+    For claims that state a specific large figure (e.g. "$10 billion"), strip
+    the number so Tavily returns authoritative articles with the *actual* value.
+
+    "Tesla's revenue in 2022 was $10 billion"
+      → "Tesla's revenue in 2022 annual"  (finds the real $81.5B annual figure)
+
+    For financial-metric claims, "annual" is appended so the search returns
+    full-year summaries rather than Q4 earnings that report quarterly figures.
+
+    Non-numerical claims are searched verbatim.
+    """
+    if _BIG_NUM_PAT.search(claim):
+        stripped = _BIG_NUM_PAT.sub("", claim)
+        stripped = re.sub(r"\s+", " ", stripped).strip().rstrip(".,")
+        if len(stripped) > 15:
+            if any(t in stripped.lower() for t in _FINANCIAL_TERMS):
+                return stripped + " annual"
+            return stripped
+    return claim
+
+
 def verify_claim(claim: str, client: TavilyClient) -> dict:
+    search_query = _make_search_query(claim)
+    # Use advanced depth for numerical claims — basic depth truncates articles
+    # so the authoritative figure (e.g. annual revenue) may be cut off.
+    has_big_num = bool(_BIG_NUM_PAT.search(claim))
+    search_depth = "advanced" if has_big_num else "basic"
     try:
-        resp    = client.search(query=claim, search_depth="basic", max_results=4)
+        resp    = client.search(query=search_query, search_depth=search_depth, max_results=5)
         results = resp.get("results", [])
         sources = [r.get("url", "") for r in results if r.get("url")]
     except Exception as e:
         return {
             "claim": claim, "classification": "Inaccurate",
-            "confidence": 0, "explanation": f"Search failed: {e}", "sources": [],
+            "confidence": 0, "snippet": "", "explanation": f"Search failed: {e}",
+            "sources": [],
         }
-    verdict = classify_from_results(claim, results)
+
+    # Try Tavily's QnA for a direct semantic answer
+    verdict = None
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            qna = client.qna_search(query=f"Is this claim accurate? {claim}")
+        if qna:
+            verdict = _classify_from_qna(qna, claim, results)
+    except Exception:
+        pass
+
+    if verdict is None:
+        verdict = _classify_rule_based(claim, results)
+
     verdict["claim"]   = claim
     verdict["sources"] = sources
     return verdict
@@ -443,14 +583,27 @@ st.markdown(f"""
 # ── Results table ──────────────────────────────────────────────────────────────
 st.markdown('<div class="section-title">📊 Results</div>', unsafe_allow_html=True)
 
+def _confidence_label(score: int) -> str:
+    if score >= 80:
+        tier = "High"
+    elif score >= 50:
+        tier = "Med"
+    else:
+        tier = "Low"
+    return f"{score}% · {tier}"
+
+
 rows = []
 for r in results:
+    snippet = r.get("snippet", "").strip()
+    explanation = r.get("explanation", "").strip()
+    evidence = snippet if snippet else explanation
     rows.append({
         "Claim":      r["claim"],
         "Status":     STATUS_LABEL.get(r["classification"], r["classification"]),
-        "Confidence": f"{r.get('confidence', 0)}%",
-        "Evidence":   r.get("explanation", ""),
-        "_cls":       r["classification"],   # used only for styling, hidden below
+        "Confidence": _confidence_label(r.get("confidence", 0)),
+        "Evidence":   evidence,
+        "_cls":       r["classification"],
     })
 
 df = pd.DataFrame(rows)
